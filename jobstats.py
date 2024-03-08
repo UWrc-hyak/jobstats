@@ -951,7 +951,8 @@ class JobStats:
             return data
 
 
-if __name__ == "__main__":
+# if __name__ == "__main__":
+def main() -> None:
 
     parser = argparse.ArgumentParser(description="Show job utilization.")
     parser.add_argument('job', metavar='jobid', nargs='+',
