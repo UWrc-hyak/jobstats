@@ -1,4 +1,3 @@
-#!/usr/bin/python3
 import argparse
 import csv
 import datetime
@@ -13,19 +12,10 @@ import base64
 import gzip
 import syslog
 from textwrap import TextWrapper
-
-# check for the blessed module
-try:
-    from blessed import Terminal
-    blessed_is_available = True
-except ModuleNotFoundError:
-    blessed_is_available = False
-
-# prometheus server to query
-PROM_SERVER = "http://vigilant2:8480"
+import config as c
 
 # number of seconds between measurements
-SAMPLING_PERIOD = 30
+SAMPLING_PERIOD = c.SAMPLING_PERIOD
 
 # conversion factors
 SECONDS_PER_MINUTE = 60
@@ -38,16 +28,6 @@ os.environ['SLURM_TIME_FORMAT'] = "%s"
 
 # class that gets and holds per job prometheus statistics
 class JobStats:
-    # threshold values for red versus black notes
-    gpu_utilization_red   = 15 # percentage
-    gpu_utilization_black = 25 # percentage
-    cpu_utilization_red   = 65 # percentage
-    cpu_utilization_black = 80 # percentage
-    time_efficiency_red   = 40 # percentage
-    time_efficiency_black = 70 # percentage
-    min_memory_usage      = 70 # percentage
-    min_runtime_seconds   = 10 * SAMPLING_PERIOD # seconds
-
     # initialize basic job stats, can be called either with those stats
     # provided and if not it will fetch them
     def __init__(self,
@@ -74,8 +54,8 @@ class JobStats:
         self.txt_red    = color[1]
         self.txt_normal = color[2]
         # translate cluster name
-        if self.cluster == "tiger":
-            self.cluster = "tiger2"
+        if self.cluster in c.CLUSTER_TRANS:
+            self.cluster = c.CLUSTER_TRANS[self.cluster]
         if self.debug_syslog:
             syslog.openlog('jobstat[%s]' % jobid)
         if jobidraw is None:
@@ -97,7 +77,8 @@ class JobStats:
             self.timelimitraw = None
         self.diff = self.end - self.start
         # translate cluster name
-        if self.cluster == "tiger2": self.cluster = "tiger"
+        if self.cluster in c.CLUSTER_TRANS_INV:
+            self.cluster = c.CLUSTER_TRANS_INV[self.cluster]
         self.debug_print("jobid=%s, jobidraw=%s, start=%s, end=%s, gpus=%s, diff=%s, cluster=%s, data=%s, timelimitraw=%s" % 
             (self.jobid,self.jobidraw,self.start,self.end,self.gpus,self.diff,self.cluster,self.data,self.timelimitraw))
         if self.data is not None and self.data.startswith('JS1:') and len(self.data) > 10:
@@ -193,7 +174,8 @@ class JobStats:
  
         if self.jobidraw == None:
             if self.cluster:
-                self.error(f"Failed to lookup jobid %s on {self.cluster.replace('tiger2', 'tiger')}. Make sure you specified the correct cluster." % self.jobid)
+                clstr = c.CLUSTER_TRANS[self.cluster] if self.cluster in c.CLUSTER_TRANS else self.cluster
+                self.error(f"Failed to lookup jobid %s on {clstr}. Make sure you specified the correct cluster." % self.jobid)
             else:
                 self.error("Failed to lookup jobid %s." % self.jobid)
 
@@ -207,8 +189,8 @@ class JobStats:
             self.timelimitraw = int(self.timelimitraw)
         if "CANCEL" in self.state:
           self.state = "CANCELLED"
-        if len(self.jobname) > 64:
-            self.jobname = self.jobname[:64] + "..."
+        if len(self.jobname) > c.MAX_JOBNAME_LEN:
+            self.jobname = self.jobname[:c.MAX_JOBNAME_LEN] + "..."
 
         # currently running jobs will have Unknown as time
         if self.end == 'Unknown':
@@ -416,303 +398,45 @@ class JobStats:
 
     def job_notes(self):
         s = ""
-        # definitions
+        # compute several quantities which can then referenced in notes
         total_used, total, total_cores = self.cpu_mem_total__used_alloc_cores
         cores_per_node = int(self.ncpus) / int(self.nnodes)
         gb_per_core_used = total_used / total_cores / 1024**3 if total_cores != 0 else 0
         gb_per_node_used = total_used / int(self.nnodes) / 1024**3 if int(self.nnodes) != 0 else 0
-        ###################################
-        ### B O L D   R E D   N O T E S ###
-        ###################################
-        # zero GPU utilization
-        zero_gpu = False
-        if self.gpus and (self.diff > JobStats.min_runtime_seconds):
-            num_unused_gpus = sum([util == 0 for _, util, _ in self.gpu_util__node_util_index])
-            if num_unused_gpus > 0:
-                if self.gpus == 1:
-                    msg = f"This job did not use the GPU. Please resolve this " \
-                          f"before running additional jobs. Wasting " \
-                          f"resources prevents other users from getting their work done " \
-                          f"and it causes your subsequent jobs to have a lower priority. " \
-                          f"Is the code GPU-enabled? " \
-                          f"Please consult the documentation for the software. For more info:"
-                    url = "https://researchcomputing.princeton.edu/support/knowledge-base/gpu-computing"
-                    s += self.format_note(msg, url, style="bold-red")
-                else:
-                    msg = f"This job did not use {num_unused_gpus} of the {self.gpus} allocated GPUs. " \
-                          f"Please resolve this before running additional jobs. " \
-                          f"Wasting resources prevents other users from getting their work done " \
-                          f"and it causes your subsequent jobs to have a lower priority. Is the " \
-                          f"code capable of using multiple GPUs? Please consult the documentation for " \
-                          f"the software. For more info:"
-                    url = "https://researchcomputing.princeton.edu/support/knowledge-base/gpu-computing"
-                    s += self.format_note(msg, url, style="bold-red")
-                zero_gpu = True
-        # jobs that should have used mig
-        if (not zero_gpu) and (self.gpus == 1) and (self.cluster == "della") and \
-           (self.partition == "gpu") and (self.diff > JobStats.min_runtime_seconds) and \
-           (self.gpu_utilization < JobStats.gpu_utilization_red) and (int(self.ncpus) == 1) and \
-           (total_used / 1024**3 < 32):
-            gpu_mem_used, gpu_mem_alloc = self.gpu_mem_total__used_alloc
-            if gpu_mem_used / 1024**3 < 10:
-                if "sys/dashboard/sys/jupyter" in self.jobname:
-                    msg = f"This job should probably use a MIG GPU instead of a full A100 GPU. MIG is " \
-                          f"ideal for jobs with a low GPU utilization that only require a single CPU-core, " \
-                          f"less than 32 GB of CPU memory and less than 10 GB of GPU memory. To use " \
-                          f'MIG with OnDemand Jupyter, choose "mig" as the "Custom partition" when ' \
-                          f"creating the session. For more info:"
-                    url = "https://researchcomputing.princeton.edu/support/knowledge-base/jupyter#environments"
-                    s += self.format_note(msg, url, style="bold-red")
-                elif self.jobname == "interactive":
-                    msg = f"This job should probably use a MIG GPU instead of a full A100 GPU. MIG is ideal " \
-                          f"for jobs with a low GPU utilization that only require a single CPU-core, less " \
-                          f"than 32 GB of CPU memory and less than 10 GB of GPU memory. To use MIG with " \
-                          f"salloc:"
-                    cmd = f"$ salloc --nodes=1 --ntasks=1 --time=60:00 --gres=gpu:1 --partition=mig"
-                    fmi = f"For more info:"
-                    url = "https://researchcomputing.princeton.edu/systems/della#gpus"
-                    s += self.format_note(msg, cmd, fmi, url, style="bold-red")
-                else:
-                    msg = f"This job should probably use a MIG GPU instead of a full A100 GPU. MIG is " \
-                          f"ideal for jobs with a low GPU utilization that only require a single CPU-core, " \
-                          f"less than 32 GB of CPU memory and less than 10 GB of GPU memory. For " \
-                          f"future jobs, please add the following line to your Slurm script:"
-                    cmd = f"#SBATCH --partition=mig"
-                    fmi = f"For more info:"
-                    url = "https://researchcomputing.princeton.edu/systems/della#gpus"
-                    s += self.format_note(msg, cmd, fmi, url, style="bold-red")
-        # zero CPU utilization
-        zero_cpu = False
-        if (self.diff > JobStats.min_runtime_seconds):
-            num_unused_nodes = sum([used == 0 for _, used, _, _ in self.cpu_util__node_used_alloc_cores])
-            if num_unused_nodes:
-                if int(self.nnodes) == 1:
-                    msg = f"This job did not use the CPU. This suggests that something went wrong " \
-                          f"at the very beginning of the job. Check your Slurm and application " \
-                          f"scripts for errors and look for useful information in the file " \
-                          f"slurm-{self.jobid}.out if it exists."
-                    s += self.format_note(msg, style="bold-red")
-                else:
-                    msg = f"This job did not use {num_unused_nodes} of the {self.nnodes} allocated " \
-                          f"nodes. Please resolve " \
-                          f"this before running additional jobs. Is the code capable of using multiple " \
-                          f"nodes? Please consult the documentation for the software. For more info:"
-                    url = "https://researchcomputing.princeton.edu/support/knowledge-base/parallel-code"
-                    s += self.format_note(msg, url, style="bold-red")
-                zero_cpu = True
+        # zero GPU/CPU utilization
+        num_unused_gpus = sum([util == 0 for _, util, _ in self.gpu_util__node_util_index]) if self.gpus else 0
+        zero_gpu = False  # TODO
+        zero_cpu = False  # TODO
+        gpu_show = True   # TODO
         # low GPU utilization
-        if (not zero_gpu) and self.gpus and (self.gpu_utilization <= JobStats.gpu_utilization_red):
-            if ("sys/dashboard/sys/" in self.jobname or self.jobname == "interactive") and \
-               (self.diff / SECONDS_PER_HOUR > 12):
-                msg = f"The overall GPU utilization of this job is only {round(self.gpu_utilization)}%. " \
-                      f"This value is low compared to the cluster mean value of 50%. Please " \
-                      f"do not create \"salloc\" or OnDemand sessions for more than 12 hours unless you " \
-                      f"plan to work intensively during the entire period. For more info:"
-                url = "https://researchcomputing.princeton.edu/support/knowledge-base/gpu-computing#util"
-                s += self.format_note(msg, url, style="bold-red")
-            else:
-                msg = f"The overall GPU utilization of this job is only {round(self.gpu_utilization)}%. " \
-                      f"This value is low compared to the cluster mean value of 50%. Please " \
-                      f"investigate the reason(s) for the low utilization. For more info:"
-                url = "https://researchcomputing.princeton.edu/support/knowledge-base/gpu-computing#util"
-                s += self.format_note(msg, url, style="bold-red")
-        # low CPU utilization
-        if (not zero_cpu) and (not self.gpus) and (self.cpu_efficiency < JobStats.cpu_utilization_black):
-            styling = "bold-red" if self.cpu_efficiency < JobStats.cpu_utilization_red else "normal"
-            somewhat = " " if self.cpu_efficiency < JobStats.cpu_utilization_red else " somewhat "
-            ceff = self.cpu_efficiency if self.cpu_efficiency > 0 else "less than 1"
-            if int(self.ncpus) > 1:
-                msg = f"The overall CPU utilization of this job is {ceff}%. This value " \
-                      f"is{somewhat}low compared to the target range of " \
-                      f"90% and above. Please investigate the reason(s) for the low efficiency. " \
-                      f"For instance, have you conducted a scaling analysis? For more info:"
-                url = "https://researchcomputing.princeton.edu/get-started/cpu-utilization"
-                s += self.format_note(msg, url, style=styling)
-            else:
-                if self.cpu_efficiency < JobStats.cpu_utilization_red:
-                    msg = f"The CPU utilization of this job is {ceff}%. This value " \
-                          f"is low compared to the target range of 90% and above. Please " \
-                          f"investigate the reason(s) for the low efficiency. For more info:"
-                    url = "https://researchcomputing.princeton.edu/get-started/cpu-utilization"
-                    s += self.format_note(msg, url, style="bold-red")
-        # CPU job that used too many nodes
-        if (int(self.nnodes) > 1) and (cores_per_node < 16) and \
-           (gb_per_node_used < 128) and (not self.gpus):
-            msg = f"This job used {self.ncpus} CPU-cores from {self.nnodes} compute " \
-                  f"nodes. Please try to use as few nodes as possible by decreasing "\
-                  f"the value of the --nodes Slurm directive " \
-                  f"and increasing the value of --ntasks-per-node. " \
-                  f"Run the \"snodes\" command " \
-                  f"to see the number of available CPU-cores per node (see CPUS column). For more info:"
-            url = "https://researchcomputing.princeton.edu/support/knowledge-base/slurm"
-            s += self.format_note(msg, url, style="bold-red")
-        # GPU job that used too many nodes
-        if (int(self.nnodes) > 1) and (self.gpus > 0):
-            if (self.cluster == "della") and (int(self.nnodes) == self.gpus):
-                msg = f"This job used {self.gpus} GPUs from {self.nnodes} compute nodes. " \
-                      f"The GPU nodes on Della have either 2 or 4 GPUs per node. Please try " \
-                      f"to use as few nodes as possible by lowering the value of the " \
-                      f"--nodes Slurm directive and increasing the value of --gres=gpu:N. " \
-                      f"For more info:"
-                url = "https://researchcomputing.princeton.edu/support/knowledge-base/slurm#gpus"
-                s += self.format_note(msg, url, style="bold-red")
-            if (self.cluster in ["adroit", "traverse"]) and (self.gpus < 4 * int(self.nnodes)):
-                msg = f"This job used {self.gpus} GPUs from {self.nnodes} compute nodes. Please try " \
-                      f"to use as few nodes as possible by allocating more GPUs per node. The GPU " \
-                      f"nodes on {self.cluster[0].upper() + self.cluster[1:]} have " \
-                      f"4 GPUs per node. For more info:"
-                url = "https://researchcomputing.princeton.edu/support/knowledge-base/slurm#gpus"
-                s += self.format_note(msg, url, style="bold-red")
-        # out of memory
-        if (self.state == "OUT_OF_MEMORY"):
-            msg = f"This job failed because it needed more CPU memory than the amount that " \
-                  f"was requested. The solution is to resubmit the job while " \
-                  f"requesting more CPU memory by " \
-                  f"modifying the --mem-per-cpu or --mem Slurm directive. For more info: "
-            url = "https://researchcomputing.princeton.edu/support/knowledge-base/memory"
-            s += self.format_note(msg, url, style="bold-red")
-        # timeout
-        if (self.state == "TIMEOUT"):
-            msg = f"This job failed because it exceeded the time limit. If there are no " \
-                  f"other problems then the solution is to increase the value of the " \
-                  f"--time Slurm directive and resubmit the job. For more info:"
-            url = "https://researchcomputing.princeton.edu/support/knowledge-base/slurm"
-            s += self.format_note(msg, url, style="bold-red")
-        # excessive run time limit
-        if self.time_eff_violation:
-            msg = f"This job only needed {self.time_efficiency}% of the requested time " \
-                  f"which was {self.human_seconds(SECONDS_PER_MINUTE * self.timelimitraw)}. " \
-                  f"For future jobs, please request less time by modifying " \
-                  f"the --time Slurm directive. This will " \
-                  f"lower your queue times and allow the Slurm job scheduler to work more " \
-                  f"effectively for all users. For more info:"
-            url = "https://researchcomputing.princeton.edu/support/knowledge-base/slurm"
-            styling = "bold-red" if self.time_efficiency < JobStats.time_efficiency_red else "normal"
-            s += self.format_note(msg, url, style=styling)
-        #############################
-        ### P L A I N   N O T E S ###
-        #############################
-        # datascience nodes
-        cascade_max_mem = 190 # GB
-        physics_max_mem = 380 # GB
-        mem_thres_full = physics_max_mem if self.account == "physics" else cascade_max_mem
-        mem_thres = 0.8 * mem_thres_full  # only complain if less than 80% of max
-        mem_used_gb = total_used / 1024**3
-        if self.cluster == "della" and self.partition == "datascience" and (mem_used_gb < mem_thres):
-            msg = f"This job ran on a large-memory (datascience) node but it only " \
-                  f"used {round(mem_used_gb)} GB of CPU memory. The large-memory nodes " \
-                  f"should only be used for jobs that require more than {mem_thres_full} " \
-                  f"GB. Please allocate less memory by using a Slurm directive " \
-                  f"such as --mem-per-cpu={self.rounded_memory_with_safety(gb_per_core_used)}G " \
-                  f"or --mem={self.rounded_memory_with_safety(gb_per_node_used)}G. " \
-                  f"For more info:"
-            url = "https://researchcomputing.princeton.edu/support/knowledge-base/memory"
-            s += self.format_note(msg, url, style="normal")
-        # serial code using multiple CPU-cores
-        if (self.nnodes == "1") and (int(self.ncpus) > 1) and (not self.gpus):
-            eff_if_serial = 100 / int(self.ncpus)
-            ratio = self.cpu_efficiency / eff_if_serial
-            approx = " approximately " if self.cpu_efficiency != round(eff_if_serial) else " "
-            if (ratio > 0.85 and ratio < 1.1):
-                msg = f"The CPU utilization of this job ({self.cpu_efficiency}%) is{approx}equal " \
-                      f"to 1 divided by the number of allocated CPU-cores " \
-                      f"(1/{self.ncpus}={round(eff_if_serial)}%). This suggests that you may be " \
-                      f"running a code that can only use 1 CPU-core. If this is true then " \
-                      f"allocating more than 1 CPU-core is wasteful. Please consult the " \
-                      f"documentation for the software to see if it is parallelized. For more info:"
-                url = "https://researchcomputing.princeton.edu/support/knowledge-base/parallel-code"
-                s += self.format_note(msg, url)
-        # overallocating CPU memory
+        interactive_job = "sys/dashboard/sys/" in self.jobname or self.jobname == "interactive"
+        # low cpu utilization
+        somewhat = " " if self.cpu_efficiency < c.CPU_UTIL_RED else " somewhat "
+        ceff = self.cpu_efficiency if self.cpu_efficiency > 0 else "less than 1"
+        # next three lines needed for serial code using multiple CPU-cores note
+        eff_if_serial = 100 / int(self.ncpus) if self.ncpus != "0" else -1
+        serial_ratio = self.cpu_efficiency / eff_if_serial
+        approx = " approximately " if self.cpu_efficiency != round(eff_if_serial) else " "
+        # next four lines needed for excess CPU memory note
         cpu_memory_utilization = round(100 * total_used / total) if total != 0 else 0
         gb_per_core = total / total_cores / 1024**3 if total_cores != 0 else 0
         opening = f"only used {cpu_memory_utilization}%" if cpu_memory_utilization >= 1 \
                                                          else "used less than 1%"
-        cores_per_node_rc = {"adroit":32, "della":28, "stellar":min(96, 128), "tiger":40, "traverse":32}
-        cpn = cores_per_node_rc[self.cluster] if self.cluster in cores_per_node_rc else 0
-        default_mem_per_core = {"adroit":3355443200,
-                                 "della":4194304000,
-                               "stellar":7864320000,
-                                 "tiger":4294967296,
-                              "traverse":7812500000}
-        mpc = default_mem_per_core[self.cluster] if self.cluster in default_mem_per_core else 0
-        gpu_show = True
-        if self.gpus and (total < 50e9 * self.gpus):
-            gpu_show = False
-        if self.gpus and self.gpus / int(self.nnodes) == 4:
-            gpu_show = False
-        if (not zero_gpu) and (not zero_cpu) and (cpu_memory_utilization < JobStats.min_memory_usage) and \
-           (gb_per_core > (mpc / 1024**3) - 2) and (total > mpc) and gpu_show and \
-           (not self.partition == "datascience") and (not self.partition == "mig") and \
-           (self.state != "OUT_OF_MEMORY") and (cores_per_node < cpn) and \
-           (self.diff > JobStats.min_runtime_seconds):
-            msg = f"This job {opening} of the {self.cpu_memory_formatted(with_label=False)} " \
-                  f"of total allocated CPU memory. " \
-                  f"For future jobs, please allocate less memory by using a Slurm directive such " \
-                  f"as --mem-per-cpu={self.rounded_memory_with_safety(gb_per_core_used)}G or " \
-                  f"--mem={self.rounded_memory_with_safety(gb_per_node_used)}G. " \
-                  f"This will reduce your queue times and make the resources available to " \
-                  f"other users. For more info:"
-            url = "https://researchcomputing.princeton.edu/support/knowledge-base/memory"
-            s += self.format_note(msg, url)
-        # serial jobs on tiger
-        if (self.nnodes == "1") and (self.cluster == "tiger") and (not self.gpus) and \
-           (not self.qos == "tiger-test"):
-            msg = f"The Tiger cluster is intended for jobs that require multiple " \
-                  f"nodes. This job ran in the \"serial\" partition where jobs are " \
-                  f"assigned the lowest priority. On Tiger, a job will run in " \
-                  f"the \"serial\" partition if it only requires 1 node. " \
-                  f"Consider carrying out this work elsewhere."
-            s += self.format_note(msg)
-        # serial jobs on stellar
-        if (self.nnodes == "1") and (self.cluster == "stellar") and (not self.gpus) and \
-           (int(self.ncpus) < 48) and (not self.qos == "stellar-debug"):
-            msg = f"The Stellar cluster is intended for jobs that require " \
-                  f"multiple nodes. This job ran in the \"serial\" partition where jobs are " \
-                  f"assigned the lowest priority. On Stellar, a job will run in the \"serial\" " \
-                  f"partition if it requires 1 node and " \
-                  f"less than 48 CPU-cores. Consider carrying out this work elsewhere."
-            s += self.format_note(msg)
-        # somewhat low GPU utilization
-        if (not zero_gpu) and self.gpus and (self.gpu_utilization < JobStats.gpu_utilization_black) and \
-           (self.gpu_utilization > JobStats.gpu_utilization_red) and (self.diff > JobStats.min_runtime_seconds):
-            msg = f"The overall GPU utilization of this job is {round(self.gpu_utilization)}%. " \
-                  f"This value is somewhat low compared to the cluster mean value of 50%. For more info:"
-            url = "https://researchcomputing.princeton.edu/support/knowledge-base/gpu-computing#util"
-            s += self.format_note(msg, url)
-        # job ran in the test queue
-        if "test" in self.qos or "debug" in self.qos:
-            msg = f"This job ran in the {self.qos} QOS. Each user can only run a small number of " \
-                  f"jobs simultaneously in this QOS. For more info:"
-            url = "https://researchcomputing.princeton.edu/support/knowledge-base/job-priority#test-queue"
-            s += self.format_note(msg, url)
-        # job used mig
-        if self.partition == "mig":
-            msg = f"This job ran on the \"mig\" partition where each job is limited to 1 MIG GPU, " \
-                  f"1 CPU-core, 10 GB of GPU memory and 32 GB of CPU memory. A MIG GPU is " \
-                  f"about 1/7th as powerful as an A100 GPU. Please continue using the \"mig\" " \
-                  f"partition when possible. For more info:"
-            url = "https://researchcomputing.princeton.edu/systems/della#gpus"
-            s += self.format_note(msg, url)
-        # stats.rc
-        if (self.cluster == "tiger" or self.cluster == "traverse"):
-            msg = "For additional job metrics including metrics plotted against time:"
-            url = "https://stats.rc.princeton.edu  (VPN required off-campus)"
-            s += self.format_note(msg, url)
-        # mystellar
-        if (self.cluster == "stellar"):
-            msg = "For additional job metrics including metrics plotted against time:"
-            url = "https://mystellar.princeton.edu/pun/sys/jobstats  (VPN required off-campus)"
-            s += self.format_note(msg, url)
-        # mydella
-        if (self.cluster == "della"):
-            msg = "For additional job metrics including metrics plotted against time:"
-            url = "https://mydella.princeton.edu/pun/sys/jobstats  (VPN required off-campus)"
-            s += self.format_note(msg, url)
-        # myadroit
-        if (self.cluster == "adroit"):
-            msg = "For additional job metrics including metrics plotted against time:"
-            url = "https://myadroit.princeton.edu/pun/sys/jobstats  (VPN required off-campus)"
-            s += self.format_note(msg, url)
+        cpn = c.CORES_PER_NODE[self.cluster] if self.cluster in c.CORES_PER_NODE else 0
+        mpc = c.DEFAULT_MEM_PER_CORE[self.cluster] if self.cluster in c.DEFAULT_MEM_PER_CORE else 0
+        # loop over notes
+        for condition, note, style in c.NOTES:
+            if eval(condition):
+                if isinstance(note, str):
+                    note = (note,)
+                note_eval = []
+                for item in note:
+                    # check for and evaluate f-strings
+                    if ('f"' in item or "f'" in item) and "{" in item and "}" in item:
+                        note_eval.append(eval(item))
+                    else:
+                        note_eval.append(item)
+                s += self.format_note(*note_eval, style=style)
         return s
 
     def cpu_memory_formatted(self, with_label=True):
@@ -730,7 +454,7 @@ class JobStats:
         else:
             return total
         bytes_per_core = bytes_ / int(self.ncpus)
-        for unit in ['B','KB','MB','GB','TB']:
+        for unit in ['B','KB', 'MB', 'GB', 'TB']:
             if bytes_per_core < 1000:
                 break
             bytes_per_core /= 1000
@@ -749,9 +473,9 @@ class JobStats:
             self.time_efficiency = round(100 * self.diff / (SECONDS_PER_MINUTE * self.timelimitraw))
             if self.time_efficiency > 100:
                 self.time_efficiency = 100
-            if self.time_efficiency < JobStats.time_efficiency_black and self.diff > 3 * JobStats.min_runtime_seconds:
+            if self.time_efficiency < c.TIME_EFFICIENCY_BLACK and self.diff > 3 * c.MIN_RUNTIME_SECONDS:
                 self.time_eff_violation = True
-            if self.time_efficiency < JobStats.time_efficiency_red and self.time_eff_violation:
+            if self.time_efficiency < c.TIME_EFFICIENCY_RED and self.time_eff_violation:
                 clr = f"{self.txt_bold}{self.txt_red}"
         return f"     Time Limit: {clr}{self.human_seconds(SECONDS_PER_MINUTE * self.timelimitraw)}{self.txt_normal}"
 
@@ -795,8 +519,8 @@ class JobStats:
                 spaces = 0
             clr1 = ""
             clr2 = ""
-            if (x < JobStats.cpu_utilization_red and hardware == "cpu" and util and (not self.gpus)) or \
-               (x < JobStats.gpu_utilization_red and hardware == "gpu" and util):
+            if (x < c.CPU_UTIL_RED and hardware == "cpu" and util and (not self.gpus)) or \
+               (x < c.GPU_UTIL_RED and hardware == "gpu" and util):
                 clr1 = f"{self.txt_red}"
                 clr2 = f"{self.txt_bold}{self.txt_red}"
             return f"{self.txt_bold}[{self.txt_normal}" + clr1 + bars * "|" + spaces * " " + clr2 + \
@@ -943,60 +667,9 @@ class JobStats:
         if encode:
             if self.diff < 2 * SAMPLING_PERIOD:
                 return 'Short'
-            elif len(self.sp_node)==0:
+            elif len(self.sp_node) == 0:
                 return 'None'
             else:
                 return base64.b64encode(gzip.compress(data.encode('ascii'))).decode('ascii')
         else:
             return data
-
-
-# if __name__ == "__main__":
-def main() -> None:
-
-    parser = argparse.ArgumentParser(description="Show job utilization.")
-    parser.add_argument('job', metavar='jobid', nargs='+',
-                    help='Job numbers to lookup')
-    parser.add_argument("-c", "--cluster", default=None,
-                    help="Specify cluster instead of relying on default on the current machine.")
-    parser.add_argument("-j", "--json", action='store_true', default=False,
-                    help="Produce row data in json format, with no summary.")
-    parser.add_argument("-b", "--base64", action='store_true', default=False,
-                    help="Produce row data in json format, with no summary and also gzip and encode it in base64 output for db storage.")
-    parser.add_argument("-d", "--debug", action='store_true', default=False,
-                    help="Output debugging information.")
-    parser.add_argument("-S", "--syslog", action='store_true', default=False,
-                    help="Output debugging information to syslog.")
-    parser.add_argument("-s", "--simple", action='store_true', default=False,
-                    help="Output information using a simple format.")
-    parser.add_argument("-f", "--force", action='store_true', default=False,
-                    help="Force recalculation without using cached data from the database.")
-    parser.add_argument("-n", "--no-color", action='store_true', default=False,
-                    help="Output information without colorization.")
-    parser.add_argument("-p", "--prom-server", type=str, default=PROM_SERVER,
-                    help="The Prometheus server and port number.")
-    args = parser.parse_args()
-
-    if blessed_is_available:
-        term = Terminal()
-        txt_bold   = f"{term.bold}"
-        txt_red    = f"{term.red}"
-        txt_normal = f"{term.normal}"
-        color = ("", "", "") if args.no_color else (txt_bold, txt_red, txt_normal)
-    else:
-        color = ("", "", "")
-
-    for jobid in args.job:
-        #import pdb; pdb.set_trace()
-        stats = JobStats(jobid=jobid,
-                         cluster=args.cluster,
-                         prom_server=args.prom_server,
-                         debug=args.debug,
-                         debug_syslog=args.syslog,
-                         force_recalc=args.force,
-                         simple=args.simple,
-                         color=color)
-        if args.json or args.base64:
-            print(stats.report_job_json(args.base64))
-        else:
-            stats.report_job()
